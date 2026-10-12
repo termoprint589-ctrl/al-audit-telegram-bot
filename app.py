@@ -216,10 +216,10 @@ async def generate_ai_diagnosis(data: dict) -> str:
         if not report:
             raise ValueError("OpenAI вернул пустой отчёт")
         
-return (
-    "📊 <b>Ваш персональный AI-аудит</b>\n\n"
-    + html.escape(report[:2500])
-)
+        return (
+        "📊 <b>Ваш персональный AI-аудит</b>\n\n"
+        + html.escape(report[:2500])
+        )
 
     except Exception as exc:
         logger.warning("AI-аудит не удался (%s); используется резервная диагностика.", type(exc).__name__)
