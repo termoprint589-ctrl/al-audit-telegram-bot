@@ -215,7 +215,12 @@ async def generate_ai_diagnosis(data: dict) -> str:
         report = (response.output_text or "").strip()
         if not report:
             raise ValueError("OpenAI вернул пустой отчёт")
-        return "📊 <b>Ваш персональный AI-аудит</b>\n\n" + html.escape(report[:3500]).replace("\n", "<br>")
+        
+return (
+    "📊 <b>Ваш персональный AI-аудит</b>\n\n"
+    + html.escape(report[:2500])
+)
+
     except Exception as exc:
         logger.warning("AI-аудит не удался (%s); используется резервная диагностика.", type(exc).__name__)
         return diagnose(data)
@@ -242,7 +247,16 @@ async def notify_admin(message: Message, data: dict):
         f"📞 Контакт: {safe(data['contact'])}"
     )
     if data.get("ai_report"):
-        text += "\n\n🧠 <b>AI-отчёт клиенту:</b>\n" + safe(data["ai_report"][:2500])
+        
+        report_text = data["ai_report"]
+        report_text = re.sub(r"</?b>", "", report_text)
+        report_text = html.escape(html.unescape(report_text[:2500]))
+
+        text += (
+        "\n\n🧠 <b>AI-отчёт клиенту:</b>\n\n"
+        + report_text
+        )
+
     try:
         await bot.send_message(ADMIN_CHAT_ID, text)
     except TelegramAPIError:
