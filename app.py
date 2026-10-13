@@ -144,10 +144,12 @@ def fallback_report(data):
 
 
 def clean_ai_text(text):
-    text = re.sub(r'(?m)^\s{0,3}#{1,6}\s*', '', text)
-    text = text.replace('**', '').replace('__', '')
-    text = re.sub(r'(?m)^\s*[-*]\s+', '• ', text)
+    text = re.sub(r'(?m)^\s{0,3}#{1,6}[ \t]*', '', text)
+    text = html.escape(text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'(?m)^[ \t]*[-*][ \t]+', '• ', text)
     return text.strip()
+
 
 
 async def generate_ai_diagnosis(data):
