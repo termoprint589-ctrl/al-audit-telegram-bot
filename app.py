@@ -180,6 +180,10 @@ def db():
         status TEXT NOT NULL DEFAULT 'new',
         created_at TEXT NOT NULL
     )''')
+    existing_strategy = {row[1] for row in conn.execute('PRAGMA table_info(strategy_orders)')}
+    for column in ('report_json', 'paid_at', 'delivered_at'):
+        if column not in existing_strategy:
+            conn.execute(f'ALTER TABLE strategy_orders ADD COLUMN {column} TEXT')
     conn.commit()
     return conn
 
@@ -1752,6 +1756,231 @@ async def pro_retry(message: Message):
 
 # ======================================================================
 
+
+# ========== AUDIT AI STRATEGY: управляемая генерация PDF ==========
+
+def _strategy_order(order_id):
+    conn = db()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM strategy_orders WHERE id=?', (order_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+async def _strategy_generate(answers, months):
+    if openai_client is None:
+        raise RuntimeError('OPENAI_API_KEY не настроен. Создание платной стратегии недоступно.')
+    # Контакт исключён из запроса модели.
+    business = {k: v for k, v in answers.items() if k != 'contact'}
+    prompt = (
+        'Ты старший маркетинговый стратег. Составь индивидуальную реалистичную '
+        f'маркетинговую стратегию для бизнеса на {months} месяцев на русском языке. '
+        'Используй только ответы клиента, не придумывай показатели, результаты, '
+        'объём рынка, цены лидов и подтверждённые факты. Если бюджет неизвестен, '
+        'предложи экономный тестовый подход без обязательных расходов. '
+        'Разделяй гипотезы, действия и метрики для проверки. '
+        'Верни ТОЛЬКО валидный JSON объект без markdown с полями: '
+        'summary (строка 3-5 предложений), audience (строка), positioning (строка), '
+        'funnel (строка), channels (массив 3-5 объектов {name, why, actions}), '
+        'months (массив ровно '+str(months)+' объектов {month, goal, tasks, kpi, budget}), '
+        'risks (массив 3-5 строк), first_steps (массив 5 строк). '
+        'Для каждого месяца tasks — массив 3-5 конкретных строк, '
+        'kpi — массив 2-4 измеримых метрик без выдуманных целевых значений, '
+        'budget — текст с условным распределением или «уточнить после теста». '
+        'Воронка, каналы, задачи и KPI должны соответствовать нише и региону. '
+        'Это план на основе анкеты, не аудит рекламных кабинетов.\n\n'
+        + json.dumps(business, ensure_ascii=False)
+    )
+    response = await openai_client.responses.create(model=OPENAI_MODEL, input=prompt)
+    raw = (response.output_text or '').strip()
+    if raw.startswith('```'):
+        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw).strip()
+    plan = json.loads(raw)
+    if not isinstance(plan, dict) or not isinstance(plan.get('months'), list) or len(plan['months']) != months:
+        raise ValueError('ИИ вернул неполный план по месяцам')
+    for key in ('summary', 'audience', 'positioning', 'funnel', 'channels', 'risks', 'first_steps'):
+        if key not in plan:
+            raise ValueError('Отсутствует раздел '+key)
+    return plan
+
+
+def _strategy_pdf(answers, plan, months, order_id):
+    font = _pdf_font()
+    buffer = io.BytesIO()
+    navy = colors.HexColor('#081427')
+    panel = colors.HexColor('#13243A')
+    cyan = colors.HexColor('#43E1E8')
+    white = colors.HexColor('#F3F8FF')
+    muted = colors.HexColor('#ADC2D1')
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=46, rightMargin=46,
+                            topMargin=96, bottomMargin=64,
+                            title=f'Audit AI Strategy | {months} месяцев | №{order_id}')
+    body = ParagraphStyle('StrategyBody', fontName=font, fontSize=9.2, leading=15,
+                          textColor=white, spaceAfter=9, splitLongWords=True)
+    small = ParagraphStyle('StrategySmall', parent=body, fontSize=8, leading=12, textColor=muted)
+    heading = ParagraphStyle('StrategyHeading', parent=body, fontSize=13, leading=19,
+                             textColor=cyan, spaceBefore=14, spaceAfter=10)
+    title = ParagraphStyle('StrategyTitle', parent=heading, fontSize=18, leading=25)
+    story = [Paragraph(f'МАРКЕТИНГОВАЯ СТРАТЕГИЯ · {months} МЕС.', title),
+             Paragraph(f'Заказ №{order_id} · Подготовлено по ответам клиента · '
+                       + datetime.now(timezone.utc).strftime('%d.%m.%Y'), small), Spacer(1, 14)]
+
+    def para(value, style=body):
+        return Paragraph(xml_escape(str(value or '—')).replace('\n', '<br/>'), style)
+
+    def section(name, value):
+        story.append(Paragraph(xml_escape(name), heading))
+        if isinstance(value, list):
+            for item in value:
+                story.append(para('• ' + str(item)))
+        else:
+            story.append(para(value))
+
+    section('О ПРОЕКТЕ', [f'{label}: {answers.get(key, "—")}' for key, label in (
+        ('product', 'Продукт'), ('audience', 'Аудитория'), ('region', 'Регион'),
+        ('goal', 'Цель'), ('budget', 'Бюджет'), ('team', 'Исполнители'))])
+    section('СТРАТЕГИЧЕСКИЙ ВЫВОД', plan['summary'])
+    section('ЦЕЛЕВАЯ АУДИТОРИЯ', plan['audience'])
+    section('ПОЗИЦИОНИРОВАНИЕ', plan['positioning'])
+    section('ВОРОНКА ПРОДАЖ', plan['funnel'])
+    story.append(Paragraph('КАНАЛЫ ПРОДВИЖЕНИЯ', heading))
+    for item in plan['channels']:
+        if not isinstance(item, dict):
+            continue
+        story.append(para(item.get('name', 'Канал'), heading))
+        story.append(para(item.get('why', '')))
+        actions = item.get('actions', [])
+        section('Действия', actions if isinstance(actions, list) else str(actions))
+    story.append(PageBreak())
+    story.append(Paragraph('ПОМЕСЯЧНЫЙ ПЛАН', title))
+    for idx, item in enumerate(plan['months'], 1):
+        if not isinstance(item, dict):
+            continue
+        story.append(Paragraph(f'МЕСЯЦ {idx}', heading))
+        story.append(para('Цель: ' + str(item.get('goal', '—'))))
+        for task in item.get('tasks', []):
+            story.append(para('• ' + str(task)))
+        story.append(para('Контрольные метрики:', small))
+        for kpi in item.get('kpi', []):
+            story.append(para('• ' + str(kpi)))
+        story.append(para('Бюджет: ' + str(item.get('budget', 'Уточнить после теста')), small))
+        story.append(Spacer(1, 9))
+    section('РИСКИ И ОГРАНИЧЕНИЯ', plan['risks'])
+    section('ПЕРВЫЕ 5 ШАГОВ', plan['first_steps'])
+    story.append(Spacer(1, 12))
+    story.append(para('Важно: документ сформирован на основе анкеты. '
+                      'Данные CRM, рекламных кабинетов и сайта не проверялись. '
+                      'Прогноз результата не гарантируется.', small))
+
+    def decorate(canvas, document):
+        canvas.saveState()
+        w, h = A4
+        canvas.setFillColor(navy)
+        canvas.rect(0, 0, w, h, fill=1, stroke=0)
+        canvas.setFillColor(panel)
+        canvas.rect(0, h - 77, w, 77, fill=1, stroke=0)
+        canvas.setFillColor(cyan)
+        canvas.rect(0, h - 79, w, 2, fill=1, stroke=0)
+        canvas.setFont(font, 20)
+        canvas.setFillColor(white)
+        canvas.drawString(46, h - 46, 'AUDIT AI  /  STRATEGY')
+        canvas.setStrokeColor(colors.HexColor('#31506A'))
+        canvas.line(46, 47, w - 46, 47)
+        canvas.setFont(font, 8)
+        canvas.setFillColor(muted)
+        canvas.drawString(46, 32, 'ИНДИВИДУАЛЬНАЯ МАРКЕТИНГОВАЯ СТРАТЕГИЯ')
+        canvas.drawRightString(w - 46, 32, str(document.page))
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=decorate, onLaterPages=decorate)
+    return buffer.getvalue()
+
+
+@dp.message(F.text.regexp(r'^/strategy_(?:preview|paid|refresh|retry)(?:@\w+)?\s+\d+\s*$'))
+async def strategy_admin(message: Message):
+    if not _is_pro_admin(message):
+        await message.answer('Команда доступна только администратору в личном чате.')
+        return
+    command, number = message.text.split()
+    action = command.split('@')[0].replace('/strategy_', '')
+    order_id = int(number)
+    order = await asyncio.to_thread(_strategy_order, order_id)
+    if not order:
+        await message.answer('Заказ не найден.')
+        return
+    if action == 'refresh':
+        def clear():
+            conn = db()
+            try:
+                cur = conn.execute("UPDATE strategy_orders SET report_json=NULL WHERE id=? AND status='new' AND report_json IS NOT NULL", (order_id,))
+                conn.commit()
+                return cur.rowcount
+            finally:
+                conn.close()
+        changed = await asyncio.to_thread(clear)
+        await message.answer('Черновик удалён. Запустите /strategy_preview '+str(order_id) if changed else 'Нельзя обновить: черновика нет или заказ уже оплачен.')
+        return
+    if action == 'retry':
+        await message.answer('Автоматический повтор заблокирован: проверьте чат клиента и Railway Logs, чтобы не отправить документ дважды. Обратитесь к разработчику для восстановления статуса.')
+        return
+    if action == 'preview' and order['status'] != 'new':
+        await message.answer('Предпросмотр доступен только до подтверждения оплаты.')
+        return
+    if action == 'paid' and order['status'] != 'new':
+        await message.answer('Заказ уже обрабатывается или был отправлен. Повторной отправки нет.')
+        return
+    if action == 'paid' and not order.get('report_json'):
+        await message.answer('Сначала создайте и проверьте /strategy_preview '+str(order_id))
+        return
+    if action == 'paid':
+        def claim():
+            conn = db()
+            try:
+                cur = conn.execute("UPDATE strategy_orders SET status='processing', paid_at=? WHERE id=? AND status='new' AND report_json IS NOT NULL", (datetime.now(timezone.utc).isoformat(), order_id))
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+        if not await asyncio.to_thread(claim):
+            await message.answer('Заказ уже взят в обработку.')
+            return
+    await message.answer('⏳ Готовлю PDF стратегии №'+str(order_id)+'…')
+    try:
+        answers = json.loads(order['answers_json'])
+        if order.get('report_json'):
+            plan = json.loads(order['report_json'])
+        else:
+            plan = await _strategy_generate(answers, order['period_months'])
+            def snapshot():
+                conn = db()
+                try:
+                    conn.execute("UPDATE strategy_orders SET report_json=? WHERE id=? AND status='new' AND report_json IS NULL", (json.dumps(plan, ensure_ascii=False), order_id))
+                    conn.commit()
+                    row = conn.execute('SELECT report_json FROM strategy_orders WHERE id=?', (order_id,)).fetchone()
+                    return json.loads(row[0])
+                finally:
+                    conn.close()
+            plan = await asyncio.to_thread(snapshot)
+        pdf_bytes = await asyncio.to_thread(_strategy_pdf, answers, plan, order['period_months'], order_id)
+        if action == 'preview':
+            await message.answer_document(BufferedInputFile(pdf_bytes, filename=f'Audit_AI_STRATEGY_preview_{order_id}.pdf'), caption='🔐 Предпросмотр. Клиенту не отправлено. Проверьте текст, бюджет, KPI и сроки.')
+            return
+        await bot.send_document(chat_id=order['telegram_id'], document=BufferedInputFile(pdf_bytes, filename=f'Audit_AI_STRATEGY_{order_id}.pdf'), caption='🧠 Ваша индивидуальная маркетинговая стратегия Audit AI.')
+        def delivered():
+            conn = db()
+            try:
+                conn.execute("UPDATE strategy_orders SET status='delivered', delivered_at=? WHERE id=? AND status='processing'", (datetime.now(timezone.utc).isoformat(), order_id))
+                conn.commit()
+            finally:
+                conn.close()
+        await asyncio.to_thread(delivered)
+        await message.answer('✅ Стратегия отправлена клиенту по заказу №'+str(order_id))
+    except Exception:
+        logger.exception('Ошибка обработки стратегии №%s', order_id)
+        await message.answer('⚠️ Операция не завершена. Проверьте Railway Logs и чат клиента. Не повторяйте отправку до проверки.')
+# ========== конец STRATEGY ==========
 
 @dp.errors()
 async def global_error_handler(event):
