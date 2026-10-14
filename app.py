@@ -57,6 +57,11 @@ class Audit(StatesGroup):
     source = State()
     leads = State()
     website = State()
+    advantage = State()
+    tracking = State()
+    response_time = State()
+    conversion = State()
+    retention = State()
     contact = State()
 
 
@@ -117,10 +122,35 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER, username TEXT, first_name TEXT,
         niche TEXT, budget TEXT, source TEXT, leads TEXT,
-        website TEXT, contact TEXT, created_at TEXT
+        website TEXT, contact TEXT, created_at TEXT,
+        advantage TEXT, tracking TEXT, response_time TEXT, conversion TEXT, retention TEXT
     )''')
+    existing = {row[1] for row in conn.execute('PRAGMA table_info(leads)')}
+    for column in ('advantage', 'tracking', 'response_time', 'conversion', 'retention'):
+        if column not in existing:
+            conn.execute(f'ALTER TABLE leads ADD COLUMN {column} TEXT')
     conn.commit()
     return conn
+
+
+def process_scores(data):
+    """Self-reported process maturity; not measured business performance."""
+    def value(key, mapping):
+        return mapping.get(data.get(key))
+
+    return [
+        ('Упаковка', value('advantage', {'Есть преимущество': 8, 'Не сформулировано': 3})),
+        ('Привлечение', value('tracking', {'Да': 8, 'Частично': 5, 'Нет': 2})),
+        ('Аналитика', value('conversion', {'Да': 8, 'Примерно': 5, 'Нет': 2})),
+        ('Продажи', value('response_time', {'До 15 минут': 9, 'В течение дня': 6, 'Дольше': 3})),
+        ('Удержание', value('retention', {'Регулярно': 9, 'Иногда': 5, 'Нет': 2})),
+    ]
+
+
+def scores_text(data):
+    return '\n'.join(f'{name}: {score}/10' if score is not None
+                     else f'{name}: недостаточно данных'
+                     for name, score in process_scores(data))
 
 
 def fallback_report(data):
@@ -171,6 +201,7 @@ async def generate_ai_diagnosis(data):
         'Не выдумывай метрики и факты. Не называй бюджет недостаточным без знания экономики бизнеса. '
         'Не утверждай, что ты проверил сайт, рекламу или реальные продажи. Все причины называй гипотезами. '
         'Учитывай специфику ниши. Не обещай гарантированный результат. '
+        'Учитывай ответы о процессах и индексы, но не выдавай их за измеренную эффективность. '
         'Используй ТОЧНО такие разделы, каждый с новой строки:\n'
         'КРАТКИЙ ВЫВОД: 1-2 предложения.\n'
         '🔴 ПРИОРИТЕТ 1: гипотеза, почему важно, что проверить.\n'
@@ -184,14 +215,20 @@ async def generate_ai_diagnosis(data):
         f'Бюджет: {data["budget"]}\n'
         f'Источник: {data["source"]}\n'
         f'Заявок в месяц: {data["leads"]}\n'
-        f'Сайт: {data["website"]}'
+        f'Сайт: {data["website"]}\n'
+        f'Преимущество: {data["advantage"]}\n'
+        f'Учёт источников: {data["tracking"]}\n'
+        f'Скорость ответа: {data["response_time"]}\n'
+        f'Конверсия: {data["conversion"]}\n'
+        f'Повторные клиенты: {data["retention"]}\n'
+        f'Условные индексы зрелости процессов (НЕ фактические KPI):\n{scores_text(data)}'
     )
     try:
         response = await openai_client.responses.create(model=OPENAI_MODEL, input=prompt)
         report = clean_ai_text((response.output_text or '').strip())
         if not report:
             raise ValueError('Пустой ответ модели')
-        return '📊 <b>ВАШ ПЕРСОНАЛЬНЫЙ AI-АУДИТ</b>\n━━━━━━━━━━━━━━━━━━\n\n' + report[:2400]
+        return '📊 <b>ВАШ ПЕРСОНАЛЬНЫЙ AI-АУДИТ</b>\n━━━━━━━━━━━━━━━━━━\n\n' + html.escape(report[:2400])
     except Exception as exc:
         logger.warning('Ошибка AI-отчёта (%s); резервный отчёт.', type(exc).__name__)
         return fallback_report(data)
@@ -260,6 +297,23 @@ def build_pdf(data, report_html):
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
     ]))
     story.extend([tbl, Spacer(1, 18)])
+    story.append(Paragraph('ДИАГНОСТИКА ПРОЦЕССОВ', heading))
+    score_rows = []
+    for name, score in process_scores(data):
+        score_rows.append([
+            Paragraph(xml_escape(name), body),
+            Paragraph(f'{score}/10' if score is not None else 'Недостаточно данных', body)
+        ])
+    score_table = Table(score_rows, colWidths=[240, 256], hAlign='LEFT')
+    score_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), panel),
+        ('LINEBELOW', (0, 0), (-1, -2), 0.5, colors.HexColor('#284258')),
+        ('LEFTPADDING', (0, 0), (-1, -1), 13),
+        ('TOPPADDING', (0, 0), (-1, -1), 7),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ]))
+    story.extend([score_table, Spacer(1, 7), Paragraph(
+        'Условные индексы по ответам клиента: это не измеренные KPI и не оценка прибыли.', small), Spacer(1, 15)])
 
     # Strip Telegram HTML and emoji: the bundled TTF does not have emoji glyphs.
     plain = html.unescape(re.sub(r'<[^>]*>', '', report_html))
@@ -359,7 +413,13 @@ async def notify_admin(message, data):
             f'📣 Источник: {safe(data["source"])}\n'
             f'📈 Заявки/мес.: {safe(data["leads"])}\n'
             f'🌐 Сайт: {safe(data["website"])}\n'
-            f'📞 Контакт: {safe(data["contact"])}')
+            f'📞 Контакт: {safe(data["contact"])}\n\n'
+        f'📊 Процессы:\n{safe(scores_text(data))}\n'
+        f'Преимущество: {safe(data["advantage"])}\n'
+        f'Учёт источников: {safe(data["tracking"])}\n'
+        f'Ответ клиентам: {safe(data["response_time"])}\n'
+        f'Конверсия: {safe(data["conversion"])}\n'
+        f'Повторные клиенты: {safe(data["retention"])}')
     report = re.sub(r'<[^>]+>', '', html.unescape(data.get('ai_report', '')))
     if report:
         text += '\n\n🧠 <b>AI-отчёт клиенту:</b>\n\n' + html.escape(report[:2200])
@@ -372,7 +432,7 @@ async def notify_admin(message, data):
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer('👋 <b>Добро пожаловать в Audit AI!</b>\n\nХотите больше клиентов? Начните не с рекламы, а с диагностики.\n\nОтветьте на 6 вопросов и получите предварительный разбор точек роста.', reply_markup=menu())
+    await message.answer('👋 <b>Добро пожаловать в Audit AI!</b>\n\nХотите больше клиентов? Начните не с рекламы, а с диагностики.\n\nОтветьте на 11 вопросов и получите предварительный разбор точек роста.', reply_markup=menu())
 
 
 @dp.callback_query(F.data == 'audit')
@@ -380,7 +440,7 @@ async def audit_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.clear()
     await state.set_state(Audit.niche)
-    await call.message.answer('1/6. 🏷 <b>Чем занимается ваш бизнес?</b>\nНапишите нишу и при желании город/регион.', reply_markup=cancel_menu())
+    await call.message.answer('1/11. 🏷 <b>Чем занимается ваш бизнес?</b>\nНапишите нишу и при желании город/регион.', reply_markup=cancel_menu())
 
 
 @dp.message(Audit.niche)
@@ -394,7 +454,7 @@ async def niche(message: Message, state: FSMContext):
         return
     await state.update_data(niche=value)
     await state.set_state(Audit.budget)
-    await message.answer('2/6. 💰 <b>Какой рекламный бюджет в месяц?</b>', reply_markup=keyboard([
+    await message.answer('2/11. 💰 <b>Какой рекламный бюджет в месяц?</b>', reply_markup=keyboard([
         [btn('до 30 000 ₽', 'b1')], [btn('30 000–70 000 ₽', 'b2')],
         [btn('70 000–150 000 ₽', 'b3')], [btn('150 000+ ₽', 'b4')], [btn('Не знаю', 'b5')]]))
 
@@ -405,7 +465,7 @@ async def budget(call: CallbackQuery, state: FSMContext):
     values = {'b1': 'до 30 000 ₽', 'b2': '30 000–70 000 ₽', 'b3': '70 000–150 000 ₽', 'b4': '150 000+ ₽', 'b5': 'Не знаю'}
     await state.update_data(budget=values[call.data])
     await state.set_state(Audit.source)
-    await call.message.answer('3/6. 📣 <b>Откуда приходят клиенты?</b>', reply_markup=keyboard([
+    await call.message.answer('3/11. 📣 <b>Откуда приходят клиенты?</b>', reply_markup=keyboard([
         [btn('Таргет / соцсети', 's1')], [btn('Контекст', 's2')],
         [btn('Органика / SEO', 's3')], [btn('Рекомендации', 's4')],
         [btn('Смешанные каналы', 's5')], [btn('Не знаю', 's6')]]))
@@ -417,7 +477,7 @@ async def source(call: CallbackQuery, state: FSMContext):
     values = {'s1': 'Таргет / соцсети', 's2': 'Контекст', 's3': 'Органика / SEO', 's4': 'Рекомендации', 's5': 'Смешанные каналы', 's6': 'Не знаю'}
     await state.update_data(source=values[call.data])
     await state.set_state(Audit.leads)
-    await call.message.answer('4/6. 📈 <b>Сколько заявок получаете в месяц?</b>', reply_markup=keyboard([
+    await call.message.answer('4/11. 📈 <b>Сколько заявок получаете в месяц?</b>', reply_markup=keyboard([
         [btn('0–5', 'l1')], [btn('6–20', 'l2')], [btn('21–50', 'l3')],
         [btn('50+', 'l4')], [btn('Не считаем', 'l5')]]))
 
@@ -428,15 +488,61 @@ async def leads(call: CallbackQuery, state: FSMContext):
     values = {'l1': '0–5', 'l2': '6–20', 'l3': '21–50', 'l4': '50+', 'l5': 'Не считаем'}
     await state.update_data(leads=values[call.data])
     await state.set_state(Audit.website)
-    await call.message.answer('5/6. 🌐 <b>Есть сайт или посадочная страница?</b>', reply_markup=keyboard([[btn('Да', 'w1'), btn('Нет', 'w2')]]))
+    await call.message.answer('5/11. 🌐 <b>Есть сайт или посадочная страница?</b>', reply_markup=keyboard([[btn('Да', 'w1'), btn('Нет', 'w2')]]))
 
 
 @dp.callback_query(Audit.website, F.data.in_({'w1', 'w2'}))
 async def website(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.update_data(website='Да' if call.data == 'w1' else 'Нет')
+    await state.set_state(Audit.advantage)
+    await call.message.answer('6/11. 🏢 <b>Есть ли чёткое преимущество перед конкурентами?</b>', reply_markup=keyboard([
+        [btn('Да, есть', 'a1')], [btn('Не сформулировано', 'a2')], [btn('Не знаю', 'a3')]]))
+
+
+@dp.callback_query(Audit.advantage, F.data.in_({'a1', 'a2', 'a3'}))
+async def advantage(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.update_data(advantage={'a1': 'Есть преимущество', 'a2': 'Не сформулировано', 'a3': 'Не знаю'}[call.data])
+    await state.set_state(Audit.tracking)
+    await call.message.answer('7/11. 📣 <b>Отслеживаете источники заявок?</b>', reply_markup=keyboard([
+        [btn('Да', 't1'), btn('Частично', 't2')], [btn('Нет', 't3')]]))
+
+
+@dp.callback_query(Audit.tracking, F.data.in_({'t1', 't2', 't3'}))
+async def tracking(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.update_data(tracking={'t1': 'Да', 't2': 'Частично', 't3': 'Нет'}[call.data])
+    await state.set_state(Audit.response_time)
+    await call.message.answer('8/11. ⏱ <b>Как быстро отвечаете потенциальным клиентам?</b>', reply_markup=keyboard([
+        [btn('До 15 минут', 'r1')], [btn('В течение дня', 'r2')],
+        [btn('Дольше', 'r3'), btn('Не знаю', 'r4')]]))
+
+
+@dp.callback_query(Audit.response_time, F.data.in_({'r1', 'r2', 'r3', 'r4'}))
+async def response_time(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.update_data(response_time={'r1': 'До 15 минут', 'r2': 'В течение дня', 'r3': 'Дольше', 'r4': 'Не знаю'}[call.data])
+    await state.set_state(Audit.conversion)
+    await call.message.answer('9/11. 📈 <b>Знаете конверсию заявок в продажи?</b>', reply_markup=keyboard([
+        [btn('Да', 'c1'), btn('Примерно', 'c2')], [btn('Нет', 'c3')]]))
+
+
+@dp.callback_query(Audit.conversion, F.data.in_({'c1', 'c2', 'c3'}))
+async def conversion(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.update_data(conversion={'c1': 'Да', 'c2': 'Примерно', 'c3': 'Нет'}[call.data])
+    await state.set_state(Audit.retention)
+    await call.message.answer('10/11. 🤝 <b>Работаете с повторными клиентами?</b>', reply_markup=keyboard([
+        [btn('Регулярно', 'u1')], [btn('Иногда', 'u2')], [btn('Нет', 'u3')]]))
+
+
+@dp.callback_query(Audit.retention, F.data.in_({'u1', 'u2', 'u3'}))
+async def retention(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.update_data(retention={'u1': 'Регулярно', 'u2': 'Иногда', 'u3': 'Нет'}[call.data])
     await state.set_state(Audit.contact)
-    await call.message.answer('6/6. 📞 <b>Как с вами связаться для полного аудита?</b>\nУкажите Telegram @username или телефон. Не отправляйте пароли и коды.', reply_markup=cancel_menu())
+    await call.message.answer('11/11. 📞 <b>Как с вами связаться для полного аудита?</b>\nУкажите Telegram @username или телефон. Не отправляйте пароли и коды.', reply_markup=cancel_menu())
 
 
 @dp.message(Audit.contact)
@@ -449,7 +555,7 @@ async def finish(message: Message, state: FSMContext):
         await message.answer('Максимум 200 символов.')
         return
     data = await state.get_data()
-    if any(k not in data for k in ('niche', 'budget', 'source', 'leads', 'website')):
+    if any(k not in data for k in ('niche', 'budget', 'source', 'leads', 'website', 'advantage', 'tracking', 'response_time', 'conversion', 'retention')):
         await state.clear()
         await message.answer('Сессия сбросилась. Запустите аудит заново.', reply_markup=menu())
         return
@@ -459,11 +565,13 @@ async def finish(message: Message, state: FSMContext):
         conn = db()
         try:
             conn.execute('''INSERT INTO leads
-                (telegram_id, username, first_name, niche, budget, source, leads, website, contact, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (telegram_id, username, first_name, niche, budget, source, leads, website, contact, created_at,
+                 advantage, tracking, response_time, conversion, retention)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user.id, user.username, user.first_name, data['niche'], data['budget'],
                  data['source'], data['leads'], data['website'], contact,
-                 datetime.now(timezone.utc).isoformat()))
+                 datetime.now(timezone.utc).isoformat(), data['advantage'], data['tracking'],
+                 data['response_time'], data['conversion'], data['retention']))
             conn.commit()
         finally:
             conn.close()
@@ -475,7 +583,7 @@ async def finish(message: Message, state: FSMContext):
     await message.answer('⏳ <b>Готовлю персональный аудит...</b>')
     report = await generate_ai_diagnosis(data)
     data['ai_report'] = report
-    await message.answer(report, reply_markup=report_menu())
+    await message.answer(report[:3900], reply_markup=report_menu())
     try:
         pdf_bytes = await asyncio.to_thread(build_pdf, data, report)
         await message.answer_document(
@@ -492,7 +600,7 @@ async def finish(message: Message, state: FSMContext):
 @dp.callback_query(F.data == 'full_audit')
 async def full_audit(call: CallbackQuery):
     await call.answer()
-    await call.message.answer('📞 <b>Полный аудит</b>\n\nЕсли вы уже прошли 6 вопросов, ваша заявка и контакт отправлены эксперту (при настроенном уведомлении). Эксперт сможет связаться с вами для обсуждения подробного разбора.\n\nДля обновления контакта пройдите аудит ещё раз.', reply_markup=menu())
+    await call.message.answer('📞 <b>Полный аудит</b>\n\nЕсли вы уже прошли 11 вопросов, ваша заявка и контакт отправлены эксперту (при настроенном уведомлении). Эксперт сможет связаться с вами для обсуждения подробного разбора.\n\nДля обновления контакта пройдите аудит ещё раз.', reply_markup=menu())
 
 
 @dp.callback_query(F.data == 'services')
@@ -504,7 +612,7 @@ async def services(call: CallbackQuery):
 @dp.callback_query(F.data == 'how')
 async def how(call: CallbackQuery):
     await call.answer()
-    await call.message.answer('⚙️ <b>Как работает Audit AI</b>\n\n1. Вы отвечаете на 6 вопросов.\n2. Бот формирует предварительный аудит с приоритетами.\n3. Вы получаете план на 7 дней.\n4. Эксперт получает заявку и может обсудить полный аудит.\n\nРезультаты — гипотезы на основе ответов, а не проверка рекламных кабинетов.', reply_markup=menu())
+    await call.message.answer('⚙️ <b>Как работает Audit AI</b>\n\n1. Вы отвечаете на 11 вопросов.\n2. Бот оценивает зрелость пяти процессов по вашим ответам.\n3. Вы получаете предварительный аудит и план на 7 дней в PDF.\n4. Эксперт получает заявку и может обсудить полный аудит.\n\nРезультаты — гипотезы на основе ответов, а не проверка рекламных кабинетов.', reply_markup=menu())
 
 
 @dp.callback_query(F.data == 'contact')
