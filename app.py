@@ -203,6 +203,7 @@ def _pdf_font():
     """Use a Cyrillic-capable system font (available on most Debian images)."""
     candidates = [
         os.getenv('PDF_FONT_PATH', ''),
+        '/app/DejaVuSans.ttf',
         '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
         '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
         '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
@@ -216,53 +217,131 @@ def _pdf_font():
 
 
 def build_pdf(data, report_html):
-    """Generate PDF in memory; no client data is stored in temporary files."""
+    """Premium dark-themed, Cyrillic PDF generated in memory."""
     font = _pdf_font()
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=42, leftMargin=42,
-                            topMargin=44, bottomMargin=48, title='Audit AI — экспресс-аудит')
-    navy = colors.HexColor('#101A31')
-    cyan = colors.HexColor('#0C92A8')
-    gray = colors.HexColor('#475569')
-    normal = ParagraphStyle('AuditBody', fontName=font, fontSize=10, leading=16, textColor=navy, spaceAfter=9)
-    title = ParagraphStyle('AuditTitle', parent=normal, fontSize=23, leading=29, textColor=navy, spaceAfter=15)
-    section = ParagraphStyle('AuditSection', parent=normal, fontSize=12, leading=18, textColor=cyan, spaceBefore=13, spaceAfter=7)
-    caption = ParagraphStyle('AuditCaption', parent=normal, fontSize=9, leading=14, textColor=gray)
-    story = [Paragraph('AUDIT AI', title), Paragraph('ПЕРСОНАЛЬНЫЙ ЭКСПРЕСС-АУДИТ', section),
-             Paragraph('Дата: ' + datetime.now(timezone.utc).strftime('%d.%m.%Y') + ' (UTC)', caption), Spacer(1, 14)]
-    details = [('Ниша / регион', data.get('niche', '—')), ('Рекламный бюджет', data.get('budget', '—')),
-               ('Источник клиентов', data.get('source', '—')), ('Заявок в месяц', data.get('leads', '—')),
-               ('Сайт / посадочная', data.get('website', '—'))]
-    rows = [[Paragraph(xml_escape(label), caption), Paragraph(xml_escape(str(value)), normal)] for label, value in details]
-    table = Table(rows, colWidths=[142, 365], hAlign='LEFT')
-    table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#EFF8FA')),
-                               ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                               ('LEFTPADDING', (0, 0), (-1, -1), 11),
-                               ('TOPPADDING', (0, 0), (-1, -1), 8),
-                               ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                               ('LINEBELOW', (0, 0), (-1, -2), 0.4, colors.HexColor('#D7E8ED'))]))
-    story.extend([table, Spacer(1, 14), Paragraph('РЕКОМЕНДАЦИИ', section)])
-    # Telegram report is HTML; remove tags and unescape entities once for the PDF.
+    navy = colors.HexColor('#081427')
+    panel = colors.HexColor('#13243A')
+    cyan = colors.HexColor('#43E1E8')
+    white = colors.HexColor('#F3F8FF')
+    muted = colors.HexColor('#ADC2D1')
+    red = colors.HexColor('#FF747A')
+    orange = colors.HexColor('#FFB966')
+    green = colors.HexColor('#7BE0B2')
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=48, rightMargin=48,
+                            topMargin=106, bottomMargin=66,
+                            title='Audit AI | Персональный экспресс-аудит')
+    body = ParagraphStyle('ProBody', fontName=font, fontSize=9.5, leading=16,
+                          textColor=white, spaceAfter=9, splitLongWords=True)
+    small = ParagraphStyle('ProSmall', parent=body, fontSize=8.3, leading=13,
+                           textColor=muted, spaceAfter=5)
+    heading = ParagraphStyle('ProHeading', parent=body, fontSize=11.4,
+                             leading=18, textColor=cyan, spaceBefore=12, spaceAfter=8)
+    story = []
+    story.append(Paragraph('ПЕРСОНАЛЬНЫЙ ЭКСПРЕСС-АУДИТ', heading))
+    story.append(Paragraph('Диагностика на основе ответов клиента · ' +
+                           datetime.now(timezone.utc).strftime('%d.%m.%Y') + ' UTC', small))
+    story.append(Spacer(1, 13))
+    details = [('НИША / РЕГИОН', data.get('niche', '—')),
+               ('РЕКЛАМНЫЙ БЮДЖЕТ', data.get('budget', '—')),
+               ('ИСТОЧНИК КЛИЕНТОВ', data.get('source', '—')),
+               ('ЗАЯВОК В МЕСЯЦ', data.get('leads', '—')),
+               ('САЙТ / ПОСАДОЧНАЯ', data.get('website', '—'))]
+    rows = [[Paragraph(xml_escape(label), small),
+             Paragraph(xml_escape(str(value)), body)] for label, value in details]
+    tbl = Table(rows, colWidths=[166, 330], hAlign='LEFT')
+    tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), panel),
+        ('LINEBELOW', (0, 0), (-1, -2), 0.5, colors.HexColor('#284258')),
+        ('LEFTPADDING', (0, 0), (-1, -1), 13),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+        ('TOPPADDING', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    story.extend([tbl, Spacer(1, 18)])
+
+    # Strip Telegram HTML and emoji: the bundled TTF does not have emoji glyphs.
     plain = html.unescape(re.sub(r'<[^>]*>', '', report_html))
-    for line in plain.splitlines():
-        line = line.strip()
-        if not line or line in ('━━━━━━━━━━━━━━━━━━',):
+    def normalize(line):
+        line = re.sub(r'[\U0001F000-\U0010FFFF\u2600-\u27BF\uFE0F]', '', line)
+        return line.strip(' \t•━')
+
+    sections = []
+    current_title = 'ОБЩИЕ РЕКОМЕНДАЦИИ'
+    current_lines = []
+    for raw in plain.splitlines():
+        line = normalize(raw)
+        if not line or line in ('ВАШ ПЕРСОНАЛЬНЫЙ AI-АУДИТ', 'AUDIT AI | ЭКСПРЕСС-АУДИТ'):
             continue
-        safe = xml_escape(line)
-        if any(x in line.upper() for x in ('ПРИОРИТЕТ 1', 'ПРИОРИТЕТ 2', 'ПРИОРИТЕТ 3', 'ПЛАН НА 7 ДНЕЙ', 'ДЛЯ ТОЧНОГО АУДИТА', 'КРАТКИЙ ВЫВОД')):
-            story.append(Paragraph(safe, section))
+        match = re.match(r'^(КРАТКИЙ ВЫВОД|ПРИОРИТЕТ [123]|ПЛАН НА 7 ДНЕЙ|ДЛЯ ТОЧНОГО АУДИТА)\s*:?\s*(.*)$', line, re.I)
+        if match:
+            if current_lines:
+                sections.append((current_title, current_lines))
+            current_title = match.group(1).upper()
+            current_lines = [match.group(2)] if match.group(2) else []
         else:
-            story.append(Paragraph(safe, normal))
-    story.extend([Spacer(1, 14), Paragraph('Выводы предварительные и основаны только на ответах клиента. '
-                                           'Рекламные кабинеты, сайт и продажи автоматически не проверялись.', caption)])
-    def footer(canvas, document):
-        canvas.setStrokeColor(cyan)
-        canvas.line(42, 37, A4[0] - 42, 37)
+            current_lines.append(line)
+    if current_lines:
+        sections.append((current_title, current_lines))
+
+    priority_colors = {'ПРИОРИТЕТ 1': red, 'ПРИОРИТЕТ 2': orange, 'ПРИОРИТЕТ 3': green}
+    for title, lines in sections:
+        accent = priority_colors.get(title, cyan)
+        label_style = ParagraphStyle('Label_' + str(len(story)), parent=heading,
+                                     textColor=accent, spaceBefore=0, spaceAfter=7)
+        elements = [Paragraph(xml_escape(title), label_style)]
+        for line in lines:
+            elements.append(Paragraph(xml_escape(line), body))
+        # Single panel per section; panels can split safely if unusually long.
+        cell = [*elements]
+        card = Table([[cell]], colWidths=[496], hAlign='LEFT')
+        card.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), panel),
+            ('LINEBEFORE', (0, 0), (0, 0), 3, accent),
+            ('LEFTPADDING', (0, 0), (-1, -1), 15),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 15),
+            ('TOPPADDING', (0, 0), (-1, -1), 13),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ]))
+        # Prevent heading/cards from being cut between pages.
+        story.extend([KeepTogether([card]), Spacer(1, 12)])
+    story.extend([Spacer(1, 7), Paragraph(
+        'ВАЖНО: это предварительные гипотезы на основе анкеты. '
+        'Сайт, рекламные кабинеты и продажи автоматически не проверялись.', small)])
+
+    logo_path = os.getenv('PDF_LOGO_PATH', '/app/audit_ai_logo.png')
+    def decorate(canvas, document):
+        canvas.saveState()
+        w, h = A4
+        canvas.setFillColor(navy)
+        canvas.rect(0, 0, w, h, fill=1, stroke=0)
+        canvas.setFillColor(panel)
+        canvas.rect(0, h - 86, w, 86, fill=1, stroke=0)
+        canvas.setFillColor(cyan)
+        canvas.rect(0, h - 88, w, 2, fill=1, stroke=0)
+        logo_x = 48
+        if Path(logo_path).is_file():
+            try:
+                canvas.drawImage(ImageReader(logo_path), logo_x, h - 74,
+                                 width=57, height=57, preserveAspectRatio=True, mask='auto')
+                logo_x = 115
+            except Exception:
+                logger.warning('Логотип PDF не удалось прочитать, использую текст.')
+        canvas.setFont(font, 21)
+        canvas.setFillColor(white)
+        canvas.drawString(logo_x, h - 45, 'AUDIT AI')
         canvas.setFont(font, 8)
-        canvas.setFillColor(gray)
-        canvas.drawString(42, 24, 'AUDIT AI  |  Предварительная диагностика')
-        canvas.drawRightString(A4[0] - 42, 24, str(document.page))
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+        canvas.setFillColor(cyan)
+        canvas.drawString(logo_x, h - 62, 'АНАЛИТИКА  /  ТОЧКИ РОСТА  /  ПЛАН ДЕЙСТВИЙ')
+        canvas.setStrokeColor(colors.HexColor('#31506A'))
+        canvas.line(48, 47, w - 48, 47)
+        canvas.setFont(font, 8)
+        canvas.setFillColor(muted)
+        canvas.drawString(48, 32, 'AUDIT AI  •  ПРЕДВАРИТЕЛЬНАЯ ДИАГНОСТИКА')
+        canvas.drawRightString(w - 48, 32, str(document.page))
+        canvas.restoreState()
+    doc.build(story, onFirstPage=decorate, onLaterPages=decorate)
     return buffer.getvalue()
 
 async def notify_admin(message, data):
