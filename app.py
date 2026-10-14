@@ -72,20 +72,6 @@ class Audit(StatesGroup):
     contact = State()
 
 
-class Strategy(StatesGroup):
-    product = State()
-    audience = State()
-    region = State()
-    goal = State()
-    budget = State()
-    channels = State()
-    sales = State()
-    challenge = State()
-    team = State()
-    target = State()
-    contact = State()
-
-
 class RateLimit(BaseMiddleware):
     def __init__(self):
         self.last_seen = defaultdict(float)
@@ -122,7 +108,6 @@ def menu():
         [btn('🔎 Провести AI-аудит', 'audit')],
         [btn('💼 Услуги', 'services'), btn('📈 Как это работает', 'how')],
         [btn('💎 Тарифы и заказы', 'tariffs')],
-        [btn('🧠 AI-СТРАТЕГИЯ', 'strategy_menu')],
         [btn('📞 Связаться с экспертом', 'contact')],
     ])
 
@@ -170,16 +155,6 @@ def db():
     for column in ('paid_at', 'delivered_at', 'report_json'):
         if column not in existing_orders:
             conn.execute(f'ALTER TABLE orders ADD COLUMN {column} TEXT')
-    conn.execute('''CREATE TABLE IF NOT EXISTS strategy_orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_id INTEGER NOT NULL,
-        username TEXT,
-        period_months INTEGER NOT NULL,
-        price_rub INTEGER NOT NULL,
-        answers_json TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'new',
-        created_at TEXT NOT NULL
-    )''')
     conn.commit()
     return conn
 
@@ -677,153 +652,6 @@ async def finish(message: Message, state: FSMContext):
         await message.answer('⚠️ PDF пока недоступен, но текстовый аудит уже готов.')
     await notify_admin(message, data)
     await state.clear()
-
-
-# AUDIT AI STRATEGY: intake and manual orders (phase 1).
-# The current version does NOT promise an automatically generated strategy.
-STRATEGY_PRICES = {3: 1990, 6: 3490, 12: 5990}
-STRATEGY_FIELDS = [
-    ('product', 'Какой товар или услугу вы продаёте?'),
-    ('audience', 'Кто ваши основные покупатели?'),
-    ('region', 'В каком городе или регионе работаете?'),
-    ('goal', 'Какова главная цель продвижения?'),
-    ('budget', 'Какой бюджет на маркетинг в месяц (в рублях)? Если неизвестен — так и напишите.'),
-    ('channels', 'Какие каналы привлечения уже используете?'),
-    ('sales', 'Сколько примерно заявок и продаж за месяц? Если не считаете — укажите это.'),
-    ('challenge', 'Какая главная трудность сейчас мешает росту?'),
-    ('team', 'Кто будет выполнять стратегию: вы сами, команда или подрядчики?'),
-    ('target', 'Какого результата хотите достичь за выбранный период?'),
-    ('contact', 'Укажите Telegram @username или телефон для связи. Не отправляйте пароли и коды.'),
-]
-
-
-def strategy_options():
-    return keyboard([
-        [btn('🟢 3 месяца — 1 990 ₽', 'str_3')],
-        [btn('🔵 6 месяцев — 3 490 ₽', 'str_6')],
-        [btn('💎 12 месяцев — 5 990 ₽', 'str_12')],
-        [btn('✖️ Отменить', 'cancel')],
-    ])
-
-
-@dp.callback_query(F.data == 'strategy_menu')
-async def strategy_menu_handler(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    await state.clear()
-    await call.message.answer(
-        '🧠 <b>AUDIT AI STRATEGY</b>\n\n'
-        'Индивидуальная маркетинговая стратегия на 3, 6 или 12 месяцев.\n'
-        'Планируем каналы, приоритеты, бюджет, KPI и этапы внедрения.\n\n'
-        'Сейчас принимаем <b>заявки</b>: после анкеты эксперт уточнит детали '
-        'и согласует оплату. Деньги автоматически не списываются; PDF автоматически не выдаётся.\n\n'
-        'Выберите срок:', reply_markup=strategy_options())
-
-
-@dp.callback_query(F.data.in_({'str_3', 'str_6', 'str_12'}))
-async def strategy_begin(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    months = int(call.data.split('_')[1])
-    await state.clear()
-    await state.update_data(strategy_period=months)
-    await state.set_state(Strategy.product)
-    await call.message.answer('🧠 <b>AI-СТРАТЕГИЯ</b> — ' + str(months) + ' мес.\n\n'
-                              '1/11. ' + STRATEGY_FIELDS[0][1], reply_markup=cancel_menu())
-
-
-@dp.message(Strategy.product, F.text)
-@dp.message(Strategy.audience, F.text)
-@dp.message(Strategy.region, F.text)
-@dp.message(Strategy.goal, F.text)
-@dp.message(Strategy.budget, F.text)
-@dp.message(Strategy.channels, F.text)
-@dp.message(Strategy.sales, F.text)
-@dp.message(Strategy.challenge, F.text)
-@dp.message(Strategy.team, F.text)
-@dp.message(Strategy.target, F.text)
-@dp.message(Strategy.contact, F.text)
-async def strategy_answer(message: Message, state: FSMContext):
-    current = await state.get_state()
-    field = current.split(':')[-1] if current else ''
-    keys = [x[0] for x in STRATEGY_FIELDS]
-    if field not in keys:
-        await state.clear()
-        await message.answer('Сессия сбросилась. Начните заново.', reply_markup=menu())
-        return
-    value = (message.text or '').strip()
-    if not value or len(value) > 700:
-        await message.answer('Напишите ответ длиной от 1 до 700 символов.')
-        return
-    await state.update_data(**{'strategy_' + field: value})
-    idx = keys.index(field)
-    if idx < len(keys) - 1:
-        next_field, question = STRATEGY_FIELDS[idx + 1]
-        await state.set_state(getattr(Strategy, next_field))
-        await message.answer(f'{idx + 2}/11. {question}', reply_markup=cancel_menu())
-        return
-    data = await state.get_data()
-    months = data.get('strategy_period')
-    if months not in STRATEGY_PRICES or any('strategy_' + k not in data for k in keys):
-        await state.clear()
-        await message.answer('Данные анкеты неполные. Начните заново.', reply_markup=menu())
-        return
-    answers = {key: data['strategy_' + key] for key in keys}
-    user = message.from_user
-
-    def save_order():
-        conn = db()
-        try:
-            cur = conn.execute('''INSERT INTO strategy_orders
-                (telegram_id, username, period_months, price_rub, answers_json, status, created_at)
-                VALUES (?, ?, ?, ?, ?, 'new', ?)''',
-                (user.id, user.username, months, STRATEGY_PRICES[months],
-                 json.dumps(answers, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
-            conn.commit()
-            return cur.lastrowid
-        finally:
-            conn.close()
-
-    try:
-        order_id = await asyncio.to_thread(save_order)
-    except sqlite3.Error:
-        logger.exception('Ошибка сохранения заявки STRATEGY')
-        await message.answer('Не удалось сохранить заявку. Попробуйте позже.')
-        return
-    await state.clear()
-    if ADMIN_CHAT_ID is not None:
-        parts = [f'🧠 <b>НОВАЯ STRATEGY-ЗАЯВКА #{order_id}</b>',
-                 f'Срок: {months} мес. | Цена: {STRATEGY_PRICES[months]:,} ₽'.replace(',', ' '),
-                 f'Клиент: {html.escape(user.full_name)}', f'ID: <code>{user.id}</code>']
-        for key, question in STRATEGY_FIELDS:
-            parts.append(f'<b>{html.escape(question)}</b>\n{html.escape(answers[key])}')
-        notify = '\n\n'.join(parts)
-        notify = html.unescape(re.sub(r'<[^>]+>', '', notify))
-        try:
-            # Split before Telegram's message limit while retaining HTML safety.
-            for chunk in [notify[i:i + 3500] for i in range(0, len(notify), 3500)]:
-                await bot.send_message(ADMIN_CHAT_ID, chunk, parse_mode=None)
-        except TelegramAPIError:
-            logger.exception('Не удалось уведомить администратора STRATEGY')
-    await message.answer(
-        f'✅ <b>Заявка на стратегию №{order_id} принята!</b>\n\n'
-        f'Период: {months} мес.\nСтоимость: {STRATEGY_PRICES[months]:,} ₽\n\n'.replace(',', ' ') +
-        'Эксперт свяжется с вами по указанному контакту. '
-        'Оплата пока не требуется; готовый документ будет подготовлен после согласования.',
-        reply_markup=menu())
-
-
-@dp.message(Strategy.product)
-@dp.message(Strategy.audience)
-@dp.message(Strategy.region)
-@dp.message(Strategy.goal)
-@dp.message(Strategy.budget)
-@dp.message(Strategy.channels)
-@dp.message(Strategy.sales)
-@dp.message(Strategy.challenge)
-@dp.message(Strategy.team)
-@dp.message(Strategy.target)
-@dp.message(Strategy.contact)
-async def strategy_nontext(message: Message):
-    await message.answer('Пожалуйста, отправьте ответ обычным текстом.')
 
 
 def tariffs_menu():
