@@ -1,4 +1,7 @@
 import asyncio
+import io
+from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 import html
 import logging
 import os
@@ -15,9 +18,17 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
 
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
@@ -144,12 +155,10 @@ def fallback_report(data):
 
 
 def clean_ai_text(text):
-    text = re.sub(r'(?m)^\s{0,3}#{1,6}[ \t]*', '', text)
-    text = html.escape(text)
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'(?m)^[ \t]*[-*][ \t]+', '• ', text)
+    text = re.sub(r'(?m)^\s{0,3}#{1,6}\s*', '', text)
+    text = text.replace('**', '').replace('__', '')
+    text = re.sub(r'(?m)^\s*[-*]\s+', '• ', text)
     return text.strip()
-
 
 
 async def generate_ai_diagnosis(data):
@@ -182,11 +191,79 @@ async def generate_ai_diagnosis(data):
         report = clean_ai_text((response.output_text or '').strip())
         if not report:
             raise ValueError('Пустой ответ модели')
-        return '📊 <b>ВАШ ПЕРСОНАЛЬНЫЙ AI-АУДИТ</b>\n━━━━━━━━━━━━━━━━━━\n\n' + html.escape(report[:2400])
+        return '📊 <b>ВАШ ПЕРСОНАЛЬНЫЙ AI-АУДИТ</b>\n━━━━━━━━━━━━━━━━━━\n\n' + report[:2400]
     except Exception as exc:
         logger.warning('Ошибка AI-отчёта (%s); резервный отчёт.', type(exc).__name__)
         return fallback_report(data)
 
+
+
+
+def _pdf_font():
+    """Use a Cyrillic-capable system font (available on most Debian images)."""
+    candidates = [
+        os.getenv('PDF_FONT_PATH', ''),
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
+        '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            if 'AuditCyr' not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont('AuditCyr', candidate))
+            return 'AuditCyr'
+    raise RuntimeError('Нет шрифта с поддержкой кириллицы. Укажите PDF_FONT_PATH.')
+
+
+def build_pdf(data, report_html):
+    """Generate PDF in memory; no client data is stored in temporary files."""
+    font = _pdf_font()
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=42, leftMargin=42,
+                            topMargin=44, bottomMargin=48, title='Audit AI — экспресс-аудит')
+    navy = colors.HexColor('#101A31')
+    cyan = colors.HexColor('#0C92A8')
+    gray = colors.HexColor('#475569')
+    normal = ParagraphStyle('AuditBody', fontName=font, fontSize=10, leading=16, textColor=navy, spaceAfter=9)
+    title = ParagraphStyle('AuditTitle', parent=normal, fontSize=23, leading=29, textColor=navy, spaceAfter=15)
+    section = ParagraphStyle('AuditSection', parent=normal, fontSize=12, leading=18, textColor=cyan, spaceBefore=13, spaceAfter=7)
+    caption = ParagraphStyle('AuditCaption', parent=normal, fontSize=9, leading=14, textColor=gray)
+    story = [Paragraph('AUDIT AI', title), Paragraph('ПЕРСОНАЛЬНЫЙ ЭКСПРЕСС-АУДИТ', section),
+             Paragraph('Дата: ' + datetime.now(timezone.utc).strftime('%d.%m.%Y') + ' (UTC)', caption), Spacer(1, 14)]
+    details = [('Ниша / регион', data.get('niche', '—')), ('Рекламный бюджет', data.get('budget', '—')),
+               ('Источник клиентов', data.get('source', '—')), ('Заявок в месяц', data.get('leads', '—')),
+               ('Сайт / посадочная', data.get('website', '—'))]
+    rows = [[Paragraph(xml_escape(label), caption), Paragraph(xml_escape(str(value)), normal)] for label, value in details]
+    table = Table(rows, colWidths=[142, 365], hAlign='LEFT')
+    table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#EFF8FA')),
+                               ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                               ('LEFTPADDING', (0, 0), (-1, -1), 11),
+                               ('TOPPADDING', (0, 0), (-1, -1), 8),
+                               ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                               ('LINEBELOW', (0, 0), (-1, -2), 0.4, colors.HexColor('#D7E8ED'))]))
+    story.extend([table, Spacer(1, 14), Paragraph('РЕКОМЕНДАЦИИ', section)])
+    # Telegram report is HTML; remove tags and unescape entities once for the PDF.
+    plain = html.unescape(re.sub(r'<[^>]*>', '', report_html))
+    for line in plain.splitlines():
+        line = line.strip()
+        if not line or line in ('━━━━━━━━━━━━━━━━━━',):
+            continue
+        safe = xml_escape(line)
+        if any(x in line.upper() for x in ('ПРИОРИТЕТ 1', 'ПРИОРИТЕТ 2', 'ПРИОРИТЕТ 3', 'ПЛАН НА 7 ДНЕЙ', 'ДЛЯ ТОЧНОГО АУДИТА', 'КРАТКИЙ ВЫВОД')):
+            story.append(Paragraph(safe, section))
+        else:
+            story.append(Paragraph(safe, normal))
+    story.extend([Spacer(1, 14), Paragraph('Выводы предварительные и основаны только на ответах клиента. '
+                                           'Рекламные кабинеты, сайт и продажи автоматически не проверялись.', caption)])
+    def footer(canvas, document):
+        canvas.setStrokeColor(cyan)
+        canvas.line(42, 37, A4[0] - 42, 37)
+        canvas.setFont(font, 8)
+        canvas.setFillColor(gray)
+        canvas.drawString(42, 24, 'AUDIT AI  |  Предварительная диагностика')
+        canvas.drawRightString(A4[0] - 42, 24, str(document.page))
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buffer.getvalue()
 
 async def notify_admin(message, data):
     if ADMIN_CHAT_ID is None:
@@ -320,6 +397,15 @@ async def finish(message: Message, state: FSMContext):
     report = await generate_ai_diagnosis(data)
     data['ai_report'] = report
     await message.answer(report, reply_markup=report_menu())
+    try:
+        pdf_bytes = await asyncio.to_thread(build_pdf, data, report)
+        await message.answer_document(
+            BufferedInputFile(pdf_bytes, filename='Audit_AI_report.pdf'),
+            caption='📄 Ваш персональный PDF-отчёт Audit AI'
+        )
+    except Exception:
+        logger.exception('Не удалось создать или отправить PDF-отчёт.')
+        await message.answer('⚠️ PDF пока недоступен, но текстовый аудит уже готов.')
     await notify_admin(message, data)
     await state.clear()
 
