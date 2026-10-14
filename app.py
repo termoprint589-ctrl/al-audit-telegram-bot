@@ -29,6 +29,7 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.graphics.shapes import Drawing, Rect
 
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
@@ -100,6 +101,7 @@ def menu():
     return keyboard([
         [btn('🔎 Провести AI-аудит', 'audit')],
         [btn('💼 Услуги', 'services'), btn('📈 Как это работает', 'how')],
+        [btn('💎 Тарифы и заказы', 'tariffs')],
         [btn('📞 Связаться с экспертом', 'contact')],
     ])
 
@@ -110,7 +112,8 @@ def cancel_menu():
 
 def report_menu():
     return keyboard([
-        [btn('📞 Получить полный аудит', 'full_audit')],
+        [btn('💎 PRO-аудит — 990 ₽', 'order_pro')],
+        [btn('👨‍💼 Аудит эксперта — от 4 990 ₽', 'order_expert')],
         [btn('🔎 Новый AI-аудит', 'audit')],
     ])
 
@@ -129,6 +132,19 @@ def db():
     for column in ('advantage', 'tracking', 'response_time', 'conversion', 'retention'):
         if column not in existing:
             conn.execute(f'ALTER TABLE leads ADD COLUMN {column} TEXT')
+    conn.execute('''CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        lead_id INTEGER,
+        tariff TEXT NOT NULL,
+        price_rub INTEGER NOT NULL,
+        contact TEXT,
+        niche TEXT,
+        status TEXT NOT NULL DEFAULT 'new',
+        created_at TEXT NOT NULL
+    )''')
     conn.commit()
     return conn
 
@@ -151,6 +167,27 @@ def scores_text(data):
     return '\n'.join(f'{name}: {score}/10' if score is not None
                      else f'{name}: недостаточно данных'
                      for name, score in process_scores(data))
+
+
+def score_reason(name, data):
+    explanations = {
+        'Упаковка': ('advantage', 'Конкурентное преимущество'),
+        'Привлечение': ('tracking', 'Учёт источников заявок'),
+        'Аналитика': ('conversion', 'Знание конверсии заявок в продажи'),
+        'Продажи': ('response_time', 'Скорость ответа на обращения'),
+        'Удержание': ('retention', 'Работа с повторными клиентами'),
+    }
+    key, label = explanations[name]
+    return f'{label}: {data.get(key, "не указано")}. Оценка только по этому ответу.'
+
+
+def pdf_score_bar(score, width=215):
+    d = Drawing(width, 12)
+    d.add(Rect(0, 2, width, 8, fillColor=colors.HexColor('#294259'), strokeColor=None))
+    if score is not None:
+        col = '#7BE0B2' if score >= 8 else '#FFB966' if score >= 5 else '#FF747A'
+        d.add(Rect(0, 2, width * score / 10, 8, fillColor=colors.HexColor(col), strokeColor=None))
+    return d
 
 
 def fallback_report(data):
@@ -300,20 +337,24 @@ def build_pdf(data, report_html):
     story.append(Paragraph('ДИАГНОСТИКА ПРОЦЕССОВ', heading))
     score_rows = []
     for name, score in process_scores(data):
+        reason = score_reason(name, data)
         score_rows.append([
             Paragraph(xml_escape(name), body),
-            Paragraph(f'{score}/10' if score is not None else 'Недостаточно данных', body)
+            [Paragraph(f'{score}/10' if score is not None else 'Нет данных', body),
+             pdf_score_bar(score), Paragraph(xml_escape(reason), small)]
         ])
-    score_table = Table(score_rows, colWidths=[240, 256], hAlign='LEFT')
+    score_table = Table(score_rows, colWidths=[130, 366], hAlign='LEFT')
     score_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, -1), panel),
         ('LINEBELOW', (0, 0), (-1, -2), 0.5, colors.HexColor('#284258')),
         ('LEFTPADDING', (0, 0), (-1, -1), 13),
-        ('TOPPADDING', (0, 0), (-1, -1), 7),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
     ]))
     story.extend([score_table, Spacer(1, 7), Paragraph(
-        'Условные индексы по ответам клиента: это не измеренные KPI и не оценка прибыли.', small), Spacer(1, 15)])
+        'Оценки — условные индексы по отдельным ответам, не фактические KPI или оценка прибыли.', small), Spacer(1, 15)])
 
     # Strip Telegram HTML and emoji: the bundled TTF does not have emoji glyphs.
     plain = html.unescape(re.sub(r'<[^>]*>', '', report_html))
@@ -363,6 +404,12 @@ def build_pdf(data, report_html):
     story.extend([Spacer(1, 7), Paragraph(
         'ВАЖНО: это предварительные гипотезы на основе анкеты. '
         'Сайт, рекламные кабинеты и продажи автоматически не проверялись.', small)])
+
+    story.extend([Spacer(1, 9), Paragraph('ЧТО ДЕЛАТЬ ДАЛЬШЕ', heading),
+                  Paragraph('Бесплатный START: экспресс-диагностика и план на 7 дней.', body),
+                  Paragraph('PRO — 990 ₽: расширенный анализ и план на 30 дней. Заказ через бота, оплата согласовывается с экспертом.', body),
+                  Paragraph('EXPERT — от 4 990 ₽: индивидуальный разбор специалистом, цена и объём согласовываются отдельно.', body),
+                  Paragraph('Для заказа вернитесь в Telegram-бот Audit AI и выберите тариф. Отчёт PRO не создаётся автоматически до согласования и оплаты.', small)])
 
     logo_path = os.getenv('PDF_LOGO_PATH', '/app/audit_ai_logo.png')
     def decorate(canvas, document):
@@ -597,10 +644,80 @@ async def finish(message: Message, state: FSMContext):
     await state.clear()
 
 
-@dp.callback_query(F.data == 'full_audit')
-async def full_audit(call: CallbackQuery):
+def tariffs_menu():
+    return keyboard([
+        [btn('💎 Заказать PRO — 990 ₽', 'order_pro')],
+        [btn('👨‍💼 Заказать EXPERT — от 4 990 ₽', 'order_expert')],
+        [btn('🔎 Бесплатный START', 'audit')],
+    ])
+
+
+@dp.callback_query(F.data == 'tariffs')
+async def tariffs(call: CallbackQuery):
     await call.answer()
-    await call.message.answer('📞 <b>Полный аудит</b>\n\nЕсли вы уже прошли 11 вопросов, ваша заявка и контакт отправлены эксперту (при настроенном уведомлении). Эксперт сможет связаться с вами для обсуждения подробного разбора.\n\nДля обновления контакта пройдите аудит ещё раз.', reply_markup=menu())
+    await call.message.answer(
+        '💼 <b>Тарифы Audit AI</b>\n\n'
+        '🟢 <b>START — бесплатно</b>\n11 вопросов, оценки процессов, PDF и план на 7 дней.\n\n'
+        '💎 <b>PRO — 990 ₽</b>\nРасширенный AI-анализ, разбор воронки и план на 30 дней.\n\n'
+        '👨‍💼 <b>EXPERT — от 4 990 ₽</b>\nИндивидуальный аудит специалистом. Итоговая цена согласовывается заранее.\n\n'
+        'Оплата пока согласовывается с экспертом вручную. Нажатие кнопки создаёт заявку, но не списывает деньги.',
+        reply_markup=tariffs_menu())
+
+
+@dp.callback_query(F.data.in_({'order_pro', 'order_expert', 'full_audit'}))
+async def place_order(call: CallbackQuery):
+    await call.answer()
+    tariff = 'PRO' if call.data == 'order_pro' else 'EXPERT'
+    price = 990 if tariff == 'PRO' else 4990
+    user = call.from_user
+    try:
+        conn = db()
+        try:
+            lead = conn.execute(
+                'SELECT id, contact, niche FROM leads WHERE telegram_id=? ORDER BY id DESC LIMIT 1',
+                (user.id,)).fetchone()
+            if lead is None:
+                await call.message.answer('Для заказа сначала пройдите бесплатную диагностику и оставьте контакт.', reply_markup=menu())
+                return
+            # Guard against repeated clicks and accidental duplicate notifications.
+            recent = conn.execute(
+                "SELECT id FROM orders WHERE telegram_id=? AND tariff=? AND lead_id=? "
+                "AND status='new' ORDER BY id DESC LIMIT 1",
+                (user.id, tariff, lead[0])).fetchone()
+            if recent:
+                await call.message.answer('✅ Ваша заявка по этому тарифу уже принята. Эксперт свяжется с вами по указанному контакту.', reply_markup=menu())
+                return
+            cursor = conn.execute(
+                'INSERT INTO orders (telegram_id, username, first_name, lead_id, tariff, price_rub, contact, niche, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (user.id, user.username, user.first_name, lead[0], tariff, price,
+                 lead[1], lead[2], datetime.now(timezone.utc).isoformat()))
+            order_id = cursor.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.exception('Не удалось сохранить заказ')
+        await call.message.answer('Не удалось оформить заявку. Попробуйте позже.')
+        return
+    if ADMIN_CHAT_ID is not None:
+        safe = lambda value: html.escape(str(value or '—'))
+        text = (f'💼 <b>НОВЫЙ ЗАКАЗ #{order_id} — AUDIT AI</b>\n'
+                f'Тариф: <b>{tariff}</b>\n'
+                f'Цена: {"990 ₽" if tariff == "PRO" else "от 4 990 ₽"}\n'
+                f'Статус: ожидает связи и оплаты\n'
+                f'Клиент: {safe(user.full_name)}\n'
+                f'ID: <code>{user.id}</code>\n'
+                f'Username: @{safe(user.username)}\n'
+                f'Ниша: {safe(lead[2])}\nКонтакт: {safe(lead[1])}')
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, text)
+        except TelegramAPIError:
+            logger.exception('Не удалось уведомить администратора о заказе')
+    await call.message.answer(
+        f'✅ <b>Заявка #{order_id} на {tariff}-аудит принята!</b>\n\n'
+        'Эксперт свяжется с вами по контакту из последней диагностики, уточнит детали и согласует оплату. '
+        'Деньги сейчас не списываются, платный отчёт пока не сформирован.', reply_markup=menu())
 
 
 @dp.callback_query(F.data == 'services')
