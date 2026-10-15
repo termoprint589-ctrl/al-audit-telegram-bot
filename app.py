@@ -20,7 +20,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
-from strategy_engine import generate_strategy
+from strategy_engine_3_3 import generate_strategy
 from strategy_pdf import build_strategy_pdf
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
