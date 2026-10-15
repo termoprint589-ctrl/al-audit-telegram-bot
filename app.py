@@ -20,6 +20,8 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
+from strategy_engine import generate_strategy
+from strategy_pdf import build_strategy_pdf
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from reportlab.lib import colors
@@ -1770,132 +1772,11 @@ def _strategy_order(order_id):
 
 
 async def _strategy_generate(answers, months):
-    if openai_client is None:
-        raise RuntimeError('OPENAI_API_KEY не настроен. Создание платной стратегии недоступно.')
-    # Контакт исключён из запроса модели.
-    business = {k: v for k, v in answers.items() if k != 'contact'}
-    prompt = (
-        'Ты старший маркетинговый стратег. Составь индивидуальную реалистичную '
-        f'маркетинговую стратегию для бизнеса на {months} месяцев на русском языке. '
-        'Используй только ответы клиента, не придумывай показатели, результаты, '
-        'объём рынка, цены лидов и подтверждённые факты. Если бюджет неизвестен, '
-        'предложи экономный тестовый подход без обязательных расходов. '
-        'Разделяй гипотезы, действия и метрики для проверки. '
-        'Верни ТОЛЬКО валидный JSON объект без markdown с полями: '
-        'summary (строка 3-5 предложений), audience (строка), positioning (строка), '
-        'funnel (строка), channels (массив 3-5 объектов {name, why, actions}), '
-        'months (массив ровно '+str(months)+' объектов {month, goal, tasks, kpi, budget}), '
-        'risks (массив 3-5 строк), first_steps (массив 5 строк). '
-        'Для каждого месяца tasks — массив 3-5 конкретных строк, '
-        'kpi — массив 2-4 измеримых метрик без выдуманных целевых значений, '
-        'budget — текст с условным распределением или «уточнить после теста». '
-        'Воронка, каналы, задачи и KPI должны соответствовать нише и региону. '
-        'Это план на основе анкеты, не аудит рекламных кабинетов.\n\n'
-        + json.dumps(business, ensure_ascii=False)
-    )
-    response = await openai_client.responses.create(model=OPENAI_MODEL, input=prompt)
-    raw = (response.output_text or '').strip()
-    if raw.startswith('```'):
-        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw).strip()
-    plan = json.loads(raw)
-    if not isinstance(plan, dict) or not isinstance(plan.get('months'), list) or len(plan['months']) != months:
-        raise ValueError('ИИ вернул неполный план по месяцам')
-    for key in ('summary', 'audience', 'positioning', 'funnel', 'channels', 'risks', 'first_steps'):
-        if key not in plan:
-            raise ValueError('Отсутствует раздел '+key)
-    return plan
+    return await generate_strategy(openai_client, OPENAI_MODEL, answers, months)
 
 
 def _strategy_pdf(answers, plan, months, order_id):
-    font = _pdf_font()
-    buffer = io.BytesIO()
-    navy = colors.HexColor('#081427')
-    panel = colors.HexColor('#13243A')
-    cyan = colors.HexColor('#43E1E8')
-    white = colors.HexColor('#F3F8FF')
-    muted = colors.HexColor('#ADC2D1')
-    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=46, rightMargin=46,
-                            topMargin=96, bottomMargin=64,
-                            title=f'Audit AI Strategy | {months} месяцев | №{order_id}')
-    body = ParagraphStyle('StrategyBody', fontName=font, fontSize=9.2, leading=15,
-                          textColor=white, spaceAfter=9, splitLongWords=True)
-    small = ParagraphStyle('StrategySmall', parent=body, fontSize=8, leading=12, textColor=muted)
-    heading = ParagraphStyle('StrategyHeading', parent=body, fontSize=13, leading=19,
-                             textColor=cyan, spaceBefore=14, spaceAfter=10)
-    title = ParagraphStyle('StrategyTitle', parent=heading, fontSize=18, leading=25)
-    story = [Paragraph(f'МАРКЕТИНГОВАЯ СТРАТЕГИЯ · {months} МЕС.', title),
-             Paragraph(f'Заказ №{order_id} · Подготовлено по ответам клиента · '
-                       + datetime.now(timezone.utc).strftime('%d.%m.%Y'), small), Spacer(1, 14)]
-
-    def para(value, style=body):
-        return Paragraph(xml_escape(str(value or '—')).replace('\n', '<br/>'), style)
-
-    def section(name, value):
-        story.append(Paragraph(xml_escape(name), heading))
-        if isinstance(value, list):
-            for item in value:
-                story.append(para('• ' + str(item)))
-        else:
-            story.append(para(value))
-
-    section('О ПРОЕКТЕ', [f'{label}: {answers.get(key, "—")}' for key, label in (
-        ('product', 'Продукт'), ('audience', 'Аудитория'), ('region', 'Регион'),
-        ('goal', 'Цель'), ('budget', 'Бюджет'), ('team', 'Исполнители'))])
-    section('СТРАТЕГИЧЕСКИЙ ВЫВОД', plan['summary'])
-    section('ЦЕЛЕВАЯ АУДИТОРИЯ', plan['audience'])
-    section('ПОЗИЦИОНИРОВАНИЕ', plan['positioning'])
-    section('ВОРОНКА ПРОДАЖ', plan['funnel'])
-    story.append(Paragraph('КАНАЛЫ ПРОДВИЖЕНИЯ', heading))
-    for item in plan['channels']:
-        if not isinstance(item, dict):
-            continue
-        story.append(para(item.get('name', 'Канал'), heading))
-        story.append(para(item.get('why', '')))
-        actions = item.get('actions', [])
-        section('Действия', actions if isinstance(actions, list) else str(actions))
-    story.append(PageBreak())
-    story.append(Paragraph('ПОМЕСЯЧНЫЙ ПЛАН', title))
-    for idx, item in enumerate(plan['months'], 1):
-        if not isinstance(item, dict):
-            continue
-        story.append(Paragraph(f'МЕСЯЦ {idx}', heading))
-        story.append(para('Цель: ' + str(item.get('goal', '—'))))
-        for task in item.get('tasks', []):
-            story.append(para('• ' + str(task)))
-        story.append(para('Контрольные метрики:', small))
-        for kpi in item.get('kpi', []):
-            story.append(para('• ' + str(kpi)))
-        story.append(para('Бюджет: ' + str(item.get('budget', 'Уточнить после теста')), small))
-        story.append(Spacer(1, 9))
-    section('РИСКИ И ОГРАНИЧЕНИЯ', plan['risks'])
-    section('ПЕРВЫЕ 5 ШАГОВ', plan['first_steps'])
-    story.append(Spacer(1, 12))
-    story.append(para('Важно: документ сформирован на основе анкеты. '
-                      'Данные CRM, рекламных кабинетов и сайта не проверялись. '
-                      'Прогноз результата не гарантируется.', small))
-
-    def decorate(canvas, document):
-        canvas.saveState()
-        w, h = A4
-        canvas.setFillColor(navy)
-        canvas.rect(0, 0, w, h, fill=1, stroke=0)
-        canvas.setFillColor(panel)
-        canvas.rect(0, h - 77, w, 77, fill=1, stroke=0)
-        canvas.setFillColor(cyan)
-        canvas.rect(0, h - 79, w, 2, fill=1, stroke=0)
-        canvas.setFont(font, 20)
-        canvas.setFillColor(white)
-        canvas.drawString(46, h - 46, 'AUDIT AI  /  STRATEGY')
-        canvas.setStrokeColor(colors.HexColor('#31506A'))
-        canvas.line(46, 47, w - 46, 47)
-        canvas.setFont(font, 8)
-        canvas.setFillColor(muted)
-        canvas.drawString(46, 32, 'ИНДИВИДУАЛЬНАЯ МАРКЕТИНГОВАЯ СТРАТЕГИЯ')
-        canvas.drawRightString(w - 46, 32, str(document.page))
-        canvas.restoreState()
-
-    doc.build(story, onFirstPage=decorate, onLaterPages=decorate)
-    return buffer.getvalue()
+    return build_strategy_pdf(answers, plan, months, order_id)
 
 
 @dp.message(F.text.regexp(r'^/strategy_(?:preview|paid|refresh|retry)(?:@\w+)?\s+\d+\s*$'))
