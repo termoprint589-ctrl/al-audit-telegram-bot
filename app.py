@@ -271,7 +271,7 @@ async def generate_ai_diagnosis(data):
     if openai_client is None:
         logger.warning('OPENAI_API_KEY не задан: резервный отчёт.')
         return fallback_report(data)
-        prompt = (
+    prompt = (
         'Ты — ведущий маркетинговый аналитик AUDIT AI. '
         'Твоя задача — провести профессиональную предварительную '
         'диагностику бизнеса на основании ответов клиента. '
