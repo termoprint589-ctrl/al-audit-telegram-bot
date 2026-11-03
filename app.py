@@ -350,7 +350,7 @@ async def generate_ai_diagnosis(data):
             raise ValueError('Пустой ответ модели')
         return '📊 <b>ВАШ ПЕРСОНАЛЬНЫЙ AI-АУДИТ</b>\n━━━━━━━━━━━━━━━━━━\n\n' + html.escape(report[:2400])
     except Exception as exc:
-        logger.warning('Ошибка AI-отчёта (%s); резервный отчёт.', type(exc).__name__)
+        logger.exception("Ошибка генерации AI-отчёта")
         return fallback_report(data)
 
 
